@@ -151,14 +151,13 @@ app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://app.thesecretsofdecoupage.com",
+        "https://thesecretsofdecoupagecom.netlify.app",
         "https://bejewelled-unicorn-4e0552.netlify.app",
-        # Local dev (opcjonalnie zostaw)
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
-        # Jeśli później dodasz własną domenę PWA, dopisz tu:
-        # "https://app.secretsofdecoupage.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
