@@ -158,20 +158,28 @@ app.add_middleware(
 def on_startup():
     create_db_and_tables()
 
-    # --- TEMP BOOTSTRAP (admin + vip) ---
-    # Set BOOTSTRAP_EMAIL on Render (e.g. aramedultd@gmail.com),
-    # then register that email once via /auth/register.
-    # On startup it will be upgraded to admin+vip automatically.
+    # TEMP BOOTSTRAP (admin+vip + reset/create password)
     bootstrap_email = os.getenv("BOOTSTRAP_EMAIL", "").strip().lower()
-    if bootstrap_email:
+    bootstrap_password = os.getenv("BOOTSTRAP_PASSWORD", "")
+
+    if bootstrap_email and bootstrap_password:
         with Session(engine) as session:
             u = session.exec(select(User).where(User.email == bootstrap_email)).first()
-            if u:
+            if not u:
+                u = User(
+                    email=bootstrap_email,
+                    hashed_password=hash_password(bootstrap_password),
+                    is_admin=True,
+                    is_vip=True,
+                )
+                session.add(u)
+                session.commit()
+            else:
+                u.hashed_password = hash_password(bootstrap_password)
                 u.is_admin = True
                 u.is_vip = True
                 session.add(u)
                 session.commit()
-    # --- END TEMP BOOTSTRAP ---
 
 
 @app.get("/health")
