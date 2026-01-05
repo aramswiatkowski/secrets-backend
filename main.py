@@ -150,20 +150,11 @@ app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 # CORS – iPhone/Netlify
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://app.thesecretsofdecoupage.com",
-        "https://thesecretsofdecoupagecom.netlify.app",
-        "https://bejewelled-unicorn-4e0552.netlify.app",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-    ],
+    allow_origin_regex=r"^https://.*$",  # tymczasowo: dopuść każdy HTTPS origin
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
