@@ -5,3 +5,4 @@ python-jose==3.3.0
 passlib[bcrypt]==1.7.4
 # Optional for web push:
 pywebpush==2.0.0
+python-multipart
