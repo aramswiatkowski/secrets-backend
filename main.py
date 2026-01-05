@@ -1,10 +1,8 @@
 from __future__ import annotations
-from fastapi.middleware.cors import CORSMiddleware
-
 
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, status, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +19,7 @@ except Exception:
     WebPushException = Exception
 
 APP_NAME = "Secrets of Decoupage"
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./secrets_app.db")
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME__USE_A_LONG_RANDOM_SECRET")
 JWT_ALG = "HS256"
@@ -34,7 +33,13 @@ pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
-engine = create_engine(DATABASE_URL, echo=False, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+)
+
+# ---------------- MODELS ----------------
 
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -44,6 +49,7 @@ class User(SQLModel, table=True):
     is_vip: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+
 class Trick(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     title: str
@@ -52,6 +58,7 @@ class Trick(SQLModel, table=True):
     is_vip: bool = False
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+
 class Post(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(index=True, foreign_key="user.id")
@@ -59,12 +66,14 @@ class Post(SQLModel, table=True):
     image_url: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+
 class Comment(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     post_id: int = Field(index=True, foreign_key="post.id")
     user_id: int = Field(index=True, foreign_key="user.id")
     text: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 
 class PushSubscription(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -74,14 +83,20 @@ class PushSubscription(SQLModel, table=True):
     auth: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+
+# ---------------- HELPERS ----------------
+
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
+
 
 def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
+
 def hash_password(plain: str) -> str:
     return pwd_context.hash(plain)
+
 
 def create_access_token(user_id: int) -> str:
     now = datetime.now(timezone.utc)
@@ -92,39 +107,49 @@ def create_access_token(user_id: int) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
+
 def get_user_from_token(token: str) -> User:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
         user_id = int(payload.get("sub"))
     except (JWTError, TypeError, ValueError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
     with Session(engine) as session:
         user = session.get(User, user_id)
         if not user:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
         return user
 
+
 def current_user(token: str = Depends(oauth2_scheme)) -> User:
     return get_user_from_token(token)
+
 
 def admin_user(user: User = Depends(current_user)) -> User:
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
     return user
 
+
+# ---------------- APP ----------------
+
 app = FastAPI(title=f"{APP_NAME} API", version="0.1.0")
 
-
+# CORS – iPhone/Netlify
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://bejewelled-unicorn-4e0552.netlify.app",
+        # Local dev (opcjonalnie zostaw)
         "http://localhost:5173",
-        "http://localhost:8000",
         "http://127.0.0.1:5173",
+        "http://localhost:8000",
         "http://127.0.0.1:8000",
-        "*",  # lock this down in production
+        # Jeśli później dodasz własną domenę PWA, dopisz tu:
+        # "https://app.secretsofdecoupage.com",
     ],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -133,9 +158,11 @@ app.add_middleware(
 def on_startup():
     create_db_and_tables()
 
+
 @app.get("/health")
 def health():
     return {"ok": True, "name": APP_NAME}
+
 
 # ---------------- AUTH ----------------
 
@@ -143,9 +170,11 @@ class AuthRegister(SQLModel):
     email: str
     password: str
 
+
 class AuthLogin(SQLModel):
     username: str  # OAuth2 form expects "username"
     password: str
+
 
 @app.post("/auth/register")
 def register(payload: AuthRegister):
@@ -168,6 +197,7 @@ def register(payload: AuthRegister):
         token = create_access_token(user.id)
         return {"access_token": token, "token_type": "bearer"}
 
+
 @app.post("/auth/login")
 def login(form: AuthLogin):
     email = form.username.strip().lower()
@@ -178,9 +208,11 @@ def login(form: AuthLogin):
         token = create_access_token(user.id)
         return {"access_token": token, "token_type": "bearer"}
 
+
 @app.get("/me")
 def me(user: User = Depends(current_user)):
     return {"id": user.id, "email": user.email, "is_admin": user.is_admin, "is_vip": user.is_vip}
+
 
 # ---------------- TRICKS ----------------
 
@@ -190,18 +222,19 @@ class TrickCreate(SQLModel):
     media_url: Optional[str] = None
     is_vip: bool = False
 
+
 @app.get("/tricks")
 def list_tricks(user: Optional[User] = Depends(lambda token=Depends(oauth2_scheme): get_user_from_token(token) if token else None)):
-    # If not logged in, only non-VIP
     with Session(engine) as session:
         tricks = session.exec(select(Trick).order_by(Trick.created_at.desc())).all()
+
     out = []
     for t in tricks:
-        if t.is_vip:
-            if not user or not user.is_vip:
-                continue
+        if t.is_vip and (not user or not user.is_vip):
+            continue
         out.append(t)
     return out
+
 
 @app.post("/tricks")
 def create_trick(payload: TrickCreate, _: User = Depends(admin_user)):
@@ -219,6 +252,7 @@ def create_trick(payload: TrickCreate, _: User = Depends(admin_user)):
         session.refresh(t)
         return t
 
+
 @app.delete("/tricks/{trick_id}")
 def delete_trick(trick_id: int, _: User = Depends(admin_user)):
     with Session(engine) as session:
@@ -229,17 +263,20 @@ def delete_trick(trick_id: int, _: User = Depends(admin_user)):
         session.commit()
         return {"ok": True}
 
+
 # ---------------- COMMUNITY ----------------
 
 class PostCreate(SQLModel):
     text: str
     image_url: Optional[str] = None
 
+
 @app.get("/posts")
 def list_posts():
     with Session(engine) as session:
         posts = session.exec(select(Post).order_by(Post.created_at.desc())).all()
     return posts
+
 
 @app.post("/posts")
 def create_post(payload: PostCreate, user: User = Depends(current_user)):
@@ -252,14 +289,17 @@ def create_post(payload: PostCreate, user: User = Depends(current_user)):
         session.refresh(p)
         return p
 
+
 class CommentCreate(SQLModel):
     text: str
+
 
 @app.get("/posts/{post_id}/comments")
 def list_comments(post_id: int):
     with Session(engine) as session:
         comments = session.exec(select(Comment).where(Comment.post_id == post_id).order_by(Comment.created_at.asc())).all()
     return comments
+
 
 @app.post("/posts/{post_id}/comments")
 def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(current_user)):
@@ -275,6 +315,7 @@ def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(cu
         session.refresh(c)
         return c
 
+
 # ---------------- ADMIN ----------------
 
 @app.post("/admin/users/{user_id}/vip")
@@ -288,6 +329,7 @@ def set_vip(user_id: int, is_vip: bool = Body(...), _: User = Depends(admin_user
         session.commit()
         return {"ok": True, "user_id": user_id, "is_vip": u.is_vip}
 
+
 @app.post("/admin/users/{user_id}/admin")
 def set_admin(user_id: int, is_admin: bool = Body(...), _: User = Depends(admin_user)):
     with Session(engine) as session:
@@ -299,6 +341,7 @@ def set_admin(user_id: int, is_admin: bool = Body(...), _: User = Depends(admin_
         session.commit()
         return {"ok": True, "user_id": user_id, "is_admin": u.is_admin}
 
+
 # ---------------- PUSH (optional) ----------------
 
 class PushSubscribe(SQLModel):
@@ -306,20 +349,27 @@ class PushSubscribe(SQLModel):
     p256dh: str
     auth: str
 
+
 @app.post("/push/subscribe")
 def push_subscribe(payload: PushSubscribe, user: User = Depends(current_user)):
     with Session(engine) as session:
-        existing = session.exec(select(PushSubscription).where(PushSubscription.user_id == user.id).where(PushSubscription.endpoint == payload.endpoint)).first()
+        existing = session.exec(
+            select(PushSubscription)
+            .where(PushSubscription.user_id == user.id)
+            .where(PushSubscription.endpoint == payload.endpoint)
+        ).first()
         if existing:
             existing.p256dh = payload.p256dh
             existing.auth = payload.auth
             session.add(existing)
             session.commit()
             return {"ok": True, "updated": True}
+
         sub = PushSubscription(user_id=user.id, endpoint=payload.endpoint, p256dh=payload.p256dh, auth=payload.auth)
         session.add(sub)
         session.commit()
         return {"ok": True}
+
 
 @app.post("/admin/push/broadcast")
 def push_broadcast(message: str = Body(..., embed=True), _: User = Depends(admin_user)):
