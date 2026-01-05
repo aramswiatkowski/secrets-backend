@@ -158,6 +158,21 @@ app.add_middleware(
 def on_startup():
     create_db_and_tables()
 
+    # --- TEMP BOOTSTRAP (admin + vip) ---
+    # Set BOOTSTRAP_EMAIL on Render (e.g. aramedultd@gmail.com),
+    # then register that email once via /auth/register.
+    # On startup it will be upgraded to admin+vip automatically.
+    bootstrap_email = os.getenv("BOOTSTRAP_EMAIL", "").strip().lower()
+    if bootstrap_email:
+        with Session(engine) as session:
+            u = session.exec(select(User).where(User.email == bootstrap_email)).first()
+            if u:
+                u.is_admin = True
+                u.is_vip = True
+                session.add(u)
+                session.commit()
+    # --- END TEMP BOOTSTRAP ---
+
 
 @app.get("/health")
 def health():
@@ -172,7 +187,7 @@ class AuthRegister(SQLModel):
 
 
 class AuthLogin(SQLModel):
-    username: str  # OAuth2 form expects "username"
+    username: str  # OAuth2 expects "username"
     password: str
 
 
@@ -224,7 +239,9 @@ class TrickCreate(SQLModel):
 
 
 @app.get("/tricks")
-def list_tricks(user: Optional[User] = Depends(lambda token=Depends(oauth2_scheme): get_user_from_token(token) if token else None)):
+def list_tricks(
+    user: Optional[User] = Depends(lambda token=Depends(oauth2_scheme): get_user_from_token(token) if token else None)
+):
     with Session(engine) as session:
         tricks = session.exec(select(Trick).order_by(Trick.created_at.desc())).all()
 
@@ -297,7 +314,9 @@ class CommentCreate(SQLModel):
 @app.get("/posts/{post_id}/comments")
 def list_comments(post_id: int):
     with Session(engine) as session:
-        comments = session.exec(select(Comment).where(Comment.post_id == post_id).order_by(Comment.created_at.asc())).all()
+        comments = session.exec(
+            select(Comment).where(Comment.post_id == post_id).order_by(Comment.created_at.asc())
+        ).all()
     return comments
 
 
@@ -365,7 +384,12 @@ def push_subscribe(payload: PushSubscribe, user: User = Depends(current_user)):
             session.commit()
             return {"ok": True, "updated": True}
 
-        sub = PushSubscription(user_id=user.id, endpoint=payload.endpoint, p256dh=payload.p256dh, auth=payload.auth)
+        sub = PushSubscription(
+            user_id=user.id,
+            endpoint=payload.endpoint,
+            p256dh=payload.p256dh,
+            auth=payload.auth,
+        )
         session.add(sub)
         session.commit()
         return {"ok": True}
