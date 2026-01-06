@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -87,6 +88,27 @@ class PushSubscription(SQLModel, table=True):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+# ---------------- MODERATION & SUPPORT ----------------
+
+class ModerationItem(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    content_type: str = Field(index=True)  # "post" or "comment"
+    content_id: int = Field(index=True)
+    status: str = Field(default="approved", index=True)  # approved | hidden | pending
+    reports: int = Field(default=0)
+    reason: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class SupportTicket(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True, foreign_key="user.id")
+    subject: str
+    message: str
+    order_number: Optional[str] = None
+    image_url: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 # ---------------- HELPERS ----------------
 
 def create_db_and_tables():
@@ -100,6 +122,54 @@ def verify_password(plain: str, hashed: str) -> bool:
 def hash_password(plain: str) -> str:
     return pwd_context.hash(plain)
 
+# --- Content safety (keep community focused on decoupage) ---
+_STORE_ISSUE_PATTERNS = [
+    r"\border\b", r"\border\s*#?\d+", r"#\d{3,8}",
+    r"\bshipping\b", r"\bdelivery\b", r"\btracking\b",
+    r"\brefund\b", r"\bchargeback\b", r"\bfraud\b", r"\bscam\b",
+    r"\bnot\s+received\b", r"didn'?t\s+arrive", r"\bmissing\b", r"\bdamaged\b",
+    r"\betsy\b", r"\bshopify\b", r"\bmy\s+order\b", r"\border\s+number\b",
+    r"\bcustomer\s+service\b", r"\bcomplain\b", r"\bcomplaint\b",
+]
+
+def _looks_like_store_issue(text: str) -> bool:
+    t = (text or "").lower()
+    for p in _STORE_ISSUE_PATTERNS:
+        try:
+            if re.search(p, t):
+                return True
+        except re.error:
+            continue
+    return False
+
+def _extract_order_number(text: str) -> Optional[str]:
+    t = (text or "")
+    m = re.search(r"(?:order\s*#?|#)\s*(\d{3,8})", t, flags=re.I)
+    return m.group(1) if m else None
+
+
+def _ensure_moderation(session: Session, content_type: str, content_id: int, status: str = "approved", reason: Optional[str] = None):
+    existing = session.exec(
+        select(ModerationItem)
+        .where(ModerationItem.content_type == content_type)
+        .where(ModerationItem.content_id == content_id)
+    ).first()
+    if existing:
+        existing.status = status
+        if reason:
+            existing.reason = reason
+        session.add(existing)
+        session.commit()
+        return existing
+
+    item = ModerationItem(content_type=content_type, content_id=content_id, status=status, reason=reason)
+    session.add(item)
+    session.commit()
+    return item
+
+def _get_mod_map(session: Session, content_type: str):
+    items = session.exec(select(ModerationItem).where(ModerationItem.content_type == content_type)).all()
+    return {i.content_id: i for i in items}
 
 def create_access_token(user_id: int) -> str:
     now = datetime.now(timezone.utc)
@@ -283,6 +353,46 @@ def change_password(payload: PasswordChange, user: User = Depends(current_user))
     return {"ok": True}
 
 
+
+# ---------------- SUPPORT (private) ----------------
+
+class SupportTicketCreate(SQLModel):
+    subject: str
+    message: str
+    order_number: Optional[str] = None
+    image_url: Optional[str] = None
+
+
+@app.post("/support/tickets")
+def create_support_ticket(payload: SupportTicketCreate, user: User = Depends(current_user)):
+    subj = (payload.subject or "").strip()[:120]
+    msg = (payload.message or "").strip()
+    if not subj:
+        subj = "Support"
+    if len(msg) < 3:
+        raise HTTPException(400, "Message too short")
+
+    with Session(engine) as session:
+        t = SupportTicket(
+            user_id=user.id,
+            subject=subj,
+            message=msg,
+            order_number=(payload.order_number or "").strip() or None,
+            image_url=(payload.image_url or "").strip() or None,
+        )
+        session.add(t)
+        session.commit()
+        session.refresh(t)
+        return {"ok": True, "ticket_id": t.id}
+
+
+@app.get("/admin/support/tickets")
+def admin_list_support_tickets(_: User = Depends(admin_user), limit: int = 100):
+    with Session(engine) as session:
+        tickets = session.exec(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(limit)).all()
+    return tickets
+
+
 # ---------------- MEDIA UPLOAD ----------------
 
 ALLOWED_IMAGE_TYPES = {
@@ -318,6 +428,36 @@ async def upload_media(
     return {"url": url}
 
 
+
+
+
+# ---------------- SHOPIFY VIP WEBHOOK (optional) ----------------
+
+class VipWebhook(SQLModel):
+    email: str
+    is_vip: bool = True
+
+
+@app.post("/webhooks/vip")
+def shopify_vip_webhook(payload: VipWebhook, request: Request):
+    secret = (os.getenv("VIP_WEBHOOK_SECRET", "") or "").strip()
+    if secret:
+        if request.headers.get("x-sod-secret", "") != secret:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    email = (payload.email or "").strip().lower()
+    if "@" not in email:
+        raise HTTPException(400, "Invalid email")
+
+    with Session(engine) as session:
+        u = session.exec(select(User).where(User.email == email)).first()
+        if not u:
+            # User must register in the app with the same email first.
+            raise HTTPException(404, "User not found (please register in the app first)")
+        u.is_vip = bool(payload.is_vip)
+        session.add(u)
+        session.commit()
+    return {"ok": True, "email": email, "is_vip": bool(payload.is_vip)}
 
 # ---------------- TRICKS ----------------
 
@@ -379,10 +519,22 @@ class PostCreate(SQLModel):
 
 
 @app.get("/posts")
-def list_posts():
+def list_posts(
+    user: Optional[User] = Depends(lambda token=Depends(oauth2_scheme): get_user_from_token(token) if token else None)
+):
     with Session(engine) as session:
         posts = session.exec(select(Post).order_by(Post.created_at.desc())).all()
-    return posts
+        mods = _get_mod_map(session, "post")
+
+    out = []
+    for p in posts:
+        mi = mods.get(p.id)
+        if mi and mi.status != "approved":
+            if not user or not user.is_admin:
+                continue
+        out.append(p)
+    return out
+
 
 
 @app.post("/posts")
@@ -402,28 +554,124 @@ class CommentCreate(SQLModel):
 
 
 @app.get("/posts/{post_id}/comments")
-def list_comments(post_id: int):
+def list_comments(
+    post_id: int,
+    user: Optional[User] = Depends(lambda token=Depends(oauth2_scheme): get_user_from_token(token) if token else None),
+):
     with Session(engine) as session:
         comments = session.exec(
             select(Comment).where(Comment.post_id == post_id).order_by(Comment.created_at.asc())
         ).all()
-    return comments
+        mods = _get_mod_map(session, "comment")
+
+    out = []
+    for c in comments:
+        mi = mods.get(c.id)
+        if mi and mi.status != "approved":
+            if not user or not user.is_admin:
+                continue
+        out.append(c)
+    return out
+
 
 
 @app.post("/posts/{post_id}/comments")
 def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(current_user)):
-    if not payload.text.strip():
+    text = (payload.text or "").strip()
+    if not text:
         raise HTTPException(400, "Text required")
+
+    # Route store/order issues to private support (not public)
+    if _looks_like_store_issue(text):
+        with Session(engine) as session:
+            t = SupportTicket(
+                user_id=user.id,
+                subject="Order / Store issue",
+                message=text,
+                order_number=_extract_order_number(text),
+            )
+            session.add(t)
+            session.commit()
+        return {"ok": True, "routed_to_support": True}
+
     with Session(engine) as session:
         p = session.get(Post, post_id)
         if not p:
             raise HTTPException(404, "Post not found")
-        c = Comment(post_id=post_id, user_id=user.id, text=payload.text.strip())
+        c = Comment(post_id=post_id, user_id=user.id, text=text)
         session.add(c)
         session.commit()
         session.refresh(c)
+        _ensure_moderation(session, "comment", c.id, status="approved")
         return c
 
+
+
+
+
+# ---------------- REPORTING & MODERATION ----------------
+
+@app.post("/posts/{post_id}/report")
+def report_post(post_id: int, user: User = Depends(current_user)):
+    with Session(engine) as session:
+        p = session.get(Post, post_id)
+        if not p:
+            raise HTTPException(404, "Post not found")
+        mi = _ensure_moderation(session, "post", post_id, status="approved")
+        mi.reports += 1
+        # Auto-hide after 3 reports
+        if mi.reports >= 3:
+            mi.status = "hidden"
+            mi.reason = "Auto-hidden after reports"
+        session.add(mi)
+        session.commit()
+    return {"ok": True}
+
+
+@app.post("/comments/{comment_id}/report")
+def report_comment(comment_id: int, user: User = Depends(current_user)):
+    with Session(engine) as session:
+        c = session.get(Comment, comment_id)
+        if not c:
+            raise HTTPException(404, "Comment not found")
+        mi = _ensure_moderation(session, "comment", comment_id, status="approved")
+        mi.reports += 1
+        if mi.reports >= 3:
+            mi.status = "hidden"
+            mi.reason = "Auto-hidden after reports"
+        session.add(mi)
+        session.commit()
+    return {"ok": True}
+
+
+@app.get("/admin/moderation/pending")
+def admin_list_pending(_: User = Depends(admin_user), limit: int = 200):
+    with Session(engine) as session:
+        items = session.exec(
+            select(ModerationItem)
+            .where(ModerationItem.status == "pending")
+            .order_by(ModerationItem.created_at.desc())
+            .limit(limit)
+        ).all()
+    return items
+
+
+class ModerationUpdate(SQLModel):
+    status: str  # approved | hidden | pending
+    reason: Optional[str] = None
+
+
+@app.post("/admin/moderation/{content_type}/{content_id}")
+def admin_set_moderation(content_type: str, content_id: int, payload: ModerationUpdate, _: User = Depends(admin_user)):
+    if content_type not in ("post", "comment"):
+        raise HTTPException(400, "Invalid content_type")
+    if payload.status not in ("approved", "hidden", "pending"):
+        raise HTTPException(400, "Invalid status")
+    with Session(engine) as session:
+        mi = _ensure_moderation(session, content_type, content_id, status=payload.status, reason=payload.reason)
+        session.add(mi)
+        session.commit()
+    return {"ok": True, "content_type": content_type, "content_id": content_id, "status": payload.status}
 
 # ---------------- ADMIN ----------------
 
