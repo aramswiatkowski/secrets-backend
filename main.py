@@ -150,11 +150,23 @@ app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 # CORS – iPhone/Netlify
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https://.*$",  # tymczasowo: dopuść każdy HTTPS origin
+    allow_origins=[
+        "https://bejewelled-unicorn-4e0552.netlify.app",
+        "https://app.thesecretsofdecoupage.com",
+        "https://thesecretsofdecoupagecom.netlify.app",
+        # Local dev (opcjonalnie zostaw)
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        # Jeśli później dodasz własną domenę PWA, dopisz tu:
+        # "https://app.secretsofdecoupage.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
@@ -242,6 +254,33 @@ def login(form: AuthLogin):
 def me(user: User = Depends(current_user)):
     return {"id": user.id, "email": user.email, "is_admin": user.is_admin, "is_vip": user.is_vip}
 
+
+
+class PasswordChange(SQLModel):
+    old_password: str
+    new_password: str
+
+
+@app.post("/me/password")
+def change_password(payload: PasswordChange, user: User = Depends(current_user)):
+    old_pw = (payload.old_password or "").strip()
+    new_pw = (payload.new_password or "").strip()
+    if not old_pw or not new_pw:
+        raise HTTPException(400, "Both old_password and new_password are required")
+    if len(new_pw) < 8:
+        raise HTTPException(400, "New password must be at least 8 characters")
+
+    with Session(engine) as session:
+        u = session.get(User, user.id)
+        if not u:
+            raise HTTPException(401, "User not found")
+        if not verify_password(old_pw, u.hashed_password):
+            raise HTTPException(status_code=401, detail="Incorrect current password")
+        u.hashed_password = hash_password(new_pw)
+        session.add(u)
+        session.commit()
+
+    return {"ok": True}
 
 
 # ---------------- MEDIA UPLOAD ----------------
