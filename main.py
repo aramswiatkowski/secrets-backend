@@ -48,6 +48,7 @@ engine = create_engine(
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str = Field(index=True, unique=True)
+    display_name: str = Field(default="", index=True)
     hashed_password: str
     is_admin: bool = False
     is_vip: bool = False
@@ -113,6 +114,23 @@ class SupportTicket(SQLModel, table=True):
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
+
+
+
+def ensure_sqlite_schema():
+    """Best-effort schema upgrades for existing SQLite files (Render free instances)."""
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    try:
+        with engine.connect() as conn:
+            rows = conn.exec_driver_sql('PRAGMA table_info("user");').fetchall()
+            cols = {r[1] for r in rows}  # r[1] = column name
+            if "display_name" not in cols:
+                conn.exec_driver_sql('ALTER TABLE "user" ADD COLUMN display_name VARCHAR;')
+                conn.commit()
+    except Exception as e:
+        # Don't crash the app if migration fails; tables will still exist.
+        print(f"[SCHEMA] ensure_sqlite_schema failed: {e}")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
@@ -205,6 +223,14 @@ def admin_user(user: User = Depends(current_user)) -> User:
     return user
 
 
+
+def _display_name_for(user: Optional[User]) -> str:
+    if not user:
+        return "Member"
+    dn = (user.display_name or "").strip()
+    return dn if dn else f"Member #{user.id}"
+
+
 # ---------------- APP ----------------
 
 app = FastAPI(title=f"{APP_NAME} API", version="0.1.0")
@@ -240,6 +266,7 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
+    ensure_sqlite_schema()
 
     # TEMP BOOTSTRAP (admin+vip + create/reset password)
     # Requires Render env vars:
@@ -247,6 +274,7 @@ def on_startup():
     #   BOOTSTRAP_PASSWORD=Aram1971
     bootstrap_email = os.getenv("BOOTSTRAP_EMAIL", "").strip().lower()
     bootstrap_password = os.getenv("BOOTSTRAP_PASSWORD", "")
+    bootstrap_display_name = os.getenv("BOOTSTRAP_DISPLAY_NAME", "Admin").strip()
 
     if bootstrap_email and bootstrap_password:
         with Session(engine) as session:
@@ -255,6 +283,7 @@ def on_startup():
                 u = User(
                     email=bootstrap_email,
                     hashed_password=hash_password(bootstrap_password),
+                    display_name=bootstrap_display_name or "Admin",
                     is_admin=True,
                     is_vip=True,
                 )
@@ -265,9 +294,27 @@ def on_startup():
                 u.hashed_password = hash_password(bootstrap_password)
                 u.is_admin = True
                 u.is_vip = True
+                if not (u.display_name or '').strip():
+                    u.display_name = bootstrap_display_name or 'Admin'
                 session.add(u)
                 session.commit()
                 print(f"[BOOTSTRAP] Updated user {bootstrap_email} password + admin+vip")
+
+    # Ensure every existing user has a non-empty display_name (never expose email publicly)
+    try:
+        with Session(engine) as session:
+            users = session.exec(select(User)).all()
+            changed = 0
+            for u in users:
+                if not (u.display_name or "").strip():
+                    u.display_name = f"Member #{u.id}"
+                    session.add(u)
+                    changed += 1
+            if changed:
+                session.commit()
+                print(f"[SCHEMA] Filled missing display_name for {changed} users")
+    except Exception as e:
+        print(f"[SCHEMA] Fill display_name failed: {e}")
 
 
 @app.get("/health")
@@ -280,6 +327,7 @@ def health():
 class AuthRegister(SQLModel):
     email: str
     password: str
+    display_name: str
 
 
 class AuthLogin(SQLModel):
@@ -295,12 +343,19 @@ def register(payload: AuthRegister):
     if len(payload.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
 
+
+    display_name = (payload.display_name or "").strip()
+    if len(display_name) < 2:
+        raise HTTPException(400, "Display name is required")
+    if len(display_name) > 32:
+        raise HTTPException(400, "Display name must be 32 characters or less")
+
     with Session(engine) as session:
         existing = session.exec(select(User).where(User.email == email)).first()
         if existing:
             raise HTTPException(409, "Email already registered")
 
-        user = User(email=email, hashed_password=hash_password(payload.password))
+        user = User(email=email, hashed_password=hash_password(payload.password), display_name=display_name)
         session.add(user)
         session.commit()
         session.refresh(user)
@@ -322,7 +377,7 @@ def login(form: AuthLogin):
 
 @app.get("/me")
 def me(user: User = Depends(current_user)):
-    return {"id": user.id, "email": user.email, "is_admin": user.is_admin, "is_vip": user.is_vip}
+    return {"id": user.id, "email": user.email, "display_name": user.display_name, "is_admin": user.is_admin, "is_vip": user.is_vip}
 
 
 
@@ -459,6 +514,30 @@ def shopify_vip_webhook(payload: VipWebhook, request: Request):
         session.commit()
     return {"ok": True, "email": email, "is_vip": bool(payload.is_vip)}
 
+
+class DisplayNameUpdate(SQLModel):
+    display_name: str
+
+
+@app.post("/me/display-name")
+def update_display_name(payload: DisplayNameUpdate, user: User = Depends(current_user)):
+    display_name = (payload.display_name or "").strip()
+    if len(display_name) < 2:
+        raise HTTPException(400, "Display name is required")
+    if len(display_name) > 32:
+        raise HTTPException(400, "Display name must be 32 characters or less")
+
+    with Session(engine) as session:
+        db_user = session.get(User, user.id)
+        if not db_user:
+            raise HTTPException(404, "User not found")
+        db_user.display_name = display_name
+        session.add(db_user)
+        session.commit()
+        session.refresh(db_user)
+        return {"ok": True, "display_name": db_user.display_name}
+
+
 # ---------------- TRICKS ----------------
 
 class TrickCreate(SQLModel):
@@ -518,6 +597,24 @@ class PostCreate(SQLModel):
     image_url: Optional[str] = None
 
 
+class PostOut(SQLModel):
+    id: int
+    user_id: int
+    author_display_name: str
+    text: str
+    image_url: Optional[str] = None
+    created_at: datetime
+
+
+class CommentOut(SQLModel):
+    id: int
+    post_id: int
+    user_id: int
+    author_display_name: str
+    text: str
+    created_at: datetime
+
+
 @app.get("/posts")
 def list_posts(
     user: Optional[User] = Depends(lambda token=Depends(oauth2_scheme): get_user_from_token(token) if token else None)
@@ -526,14 +623,30 @@ def list_posts(
         posts = session.exec(select(Post).order_by(Post.created_at.desc())).all()
         mods = _get_mod_map(session, "post")
 
-    out = []
+        user_ids = {p.user_id for p in posts}
+        name_map = {}
+        if user_ids:
+            users = session.exec(select(User).where(User.id.in_(list(user_ids)))).all()
+            name_map = {u.id: _display_name_for(u) for u in users}
+
+    out: list[PostOut] = []
     for p in posts:
         mi = mods.get(p.id)
         if mi and mi.status != "approved":
             if not user or not user.is_admin:
                 continue
-        out.append(p)
+        out.append(
+            PostOut(
+                id=p.id,
+                user_id=p.user_id,
+                author_display_name=name_map.get(p.user_id, f"Member #{p.user_id}"),
+                text=p.text,
+                image_url=p.image_url,
+                created_at=p.created_at,
+            )
+        )
     return out
+
 
 
 
@@ -541,12 +654,22 @@ def list_posts(
 def create_post(payload: PostCreate, user: User = Depends(current_user)):
     if not payload.text.strip():
         raise HTTPException(400, "Text required")
+
     with Session(engine) as session:
         p = Post(user_id=user.id, text=payload.text.strip(), image_url=payload.image_url)
         session.add(p)
         session.commit()
         session.refresh(p)
-        return p
+
+        return PostOut(
+            id=p.id,
+            user_id=p.user_id,
+            author_display_name=_display_name_for(user),
+            text=p.text,
+            image_url=p.image_url,
+            created_at=p.created_at,
+        )
+
 
 
 class CommentCreate(SQLModel):
@@ -564,14 +687,30 @@ def list_comments(
         ).all()
         mods = _get_mod_map(session, "comment")
 
-    out = []
+        user_ids = {c.user_id for c in comments}
+        name_map = {}
+        if user_ids:
+            users = session.exec(select(User).where(User.id.in_(list(user_ids)))).all()
+            name_map = {u.id: _display_name_for(u) for u in users}
+
+    out: list[CommentOut] = []
     for c in comments:
         mi = mods.get(c.id)
         if mi and mi.status != "approved":
             if not user or not user.is_admin:
                 continue
-        out.append(c)
+        out.append(
+            CommentOut(
+                id=c.id,
+                post_id=c.post_id,
+                user_id=c.user_id,
+                author_display_name=name_map.get(c.user_id, f"Member #{c.user_id}"),
+                text=c.text,
+                created_at=c.created_at,
+            )
+        )
     return out
+
 
 
 
@@ -592,40 +731,28 @@ def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(cu
             )
             session.add(t)
             session.commit()
-        return {"ok": True, "routed_to_support": True}
+            session.refresh(t)
+        return {"ok": True, "routed": "support", "ticket_id": t.id}
 
     with Session(engine) as session:
         p = session.get(Post, post_id)
         if not p:
             raise HTTPException(404, "Post not found")
+
         c = Comment(post_id=post_id, user_id=user.id, text=text)
         session.add(c)
         session.commit()
         session.refresh(c)
-        _ensure_moderation(session, "comment", c.id, status="approved")
-        return c
 
+        return CommentOut(
+            id=c.id,
+            post_id=c.post_id,
+            user_id=c.user_id,
+            author_display_name=_display_name_for(user),
+            text=c.text,
+            created_at=c.created_at,
+        )
 
-
-
-
-# ---------------- REPORTING & MODERATION ----------------
-
-@app.post("/posts/{post_id}/report")
-def report_post(post_id: int, user: User = Depends(current_user)):
-    with Session(engine) as session:
-        p = session.get(Post, post_id)
-        if not p:
-            raise HTTPException(404, "Post not found")
-        mi = _ensure_moderation(session, "post", post_id, status="approved")
-        mi.reports += 1
-        # Auto-hide after 3 reports
-        if mi.reports >= 3:
-            mi.status = "hidden"
-            mi.reason = "Auto-hidden after reports"
-        session.add(mi)
-        session.commit()
-    return {"ok": True}
 
 
 @app.post("/comments/{comment_id}/report")
