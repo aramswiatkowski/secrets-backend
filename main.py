@@ -19,6 +19,8 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 
+from sqlalchemy import text  # <-- IMPORTANT (for Postgres auto-migration)
+
 import httpx
 
 # Optional web-push support (works if you install pywebpush)
@@ -206,7 +208,6 @@ def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
 
-
 def ensure_sqlite_schema():
     """Best-effort schema upgrades for existing SQLite files (Render free instances)."""
     if not DATABASE_URL.startswith("sqlite"):
@@ -215,6 +216,8 @@ def ensure_sqlite_schema():
         with engine.connect() as conn:
             rows = conn.exec_driver_sql('PRAGMA table_info("user");').fetchall()
             cols = {r[1] for r in rows}  # r[1] = column name
+
+            # Older DBs may miss these columns
             if "display_name" not in cols:
                 conn.exec_driver_sql('ALTER TABLE "user" ADD COLUMN display_name VARCHAR;')
                 conn.commit()
@@ -224,9 +227,64 @@ def ensure_sqlite_schema():
             if "credits_balance" not in cols:
                 conn.exec_driver_sql('ALTER TABLE "user" ADD COLUMN credits_balance INTEGER DEFAULT 0;')
                 conn.commit()
+            if "is_vip" not in cols:
+                conn.exec_driver_sql('ALTER TABLE "user" ADD COLUMN is_vip BOOLEAN DEFAULT 0;')
+                conn.commit()
+            if "is_admin" not in cols:
+                conn.exec_driver_sql('ALTER TABLE "user" ADD COLUMN is_admin BOOLEAN DEFAULT 0;')
+                conn.commit()
+
+            # Backfill defaults (SQLite)
+            conn.exec_driver_sql('UPDATE "user" SET credits_balance = 0 WHERE credits_balance IS NULL;')
+            conn.exec_driver_sql(f'UPDATE "user" SET plan = "{PLAN_FREE}" WHERE plan IS NULL;')
+            conn.commit()
+
     except Exception as e:
         # Don't crash the app if migration fails; tables will still exist.
         print(f"[SCHEMA] ensure_sqlite_schema failed: {e}")
+
+
+def ensure_postgres_schema():
+    """
+    Best-effort schema upgrades for existing Postgres DB (Render FREE has no shell).
+    Fixes: column "user".plan does not exist (and similar).
+    """
+    # DATABASE_URL can be normalized to "postgresql+psycopg://..."
+    if not DATABASE_URL.startswith("postgresql"):
+        return
+
+    try:
+        with engine.begin() as conn:
+            # Add missing columns safely
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS display_name VARCHAR;'))
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS plan VARCHAR(32);'))
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS credits_balance INTEGER DEFAULT 0;'))
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS is_vip BOOLEAN DEFAULT FALSE;'))
+            conn.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE;'))
+
+            # Backfill NULLs so API never crashes on assumptions
+            conn.execute(text('UPDATE "user" SET credits_balance = 0 WHERE credits_balance IS NULL;'))
+            conn.execute(text('UPDATE "user" SET is_vip = FALSE WHERE is_vip IS NULL;'))
+            conn.execute(text('UPDATE "user" SET is_admin = FALSE WHERE is_admin IS NULL;'))
+
+            # Backfill plan:
+            # - if is_vip true and plan missing -> VIP_DIGITAL
+            # - else -> FREE
+            conn.execute(
+                text("""
+                    UPDATE "user"
+                    SET plan = CASE
+                        WHEN (is_vip = TRUE) THEN :vip
+                        ELSE :free
+                    END
+                    WHERE plan IS NULL;
+                """),
+                {"vip": PLAN_VIP_DIGITAL, "free": PLAN_FREE},
+            )
+
+    except Exception as e:
+        # Don't kill startup if migration has a hiccup
+        print(f"[SCHEMA] ensure_postgres_schema failed: {e}")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
@@ -346,7 +404,6 @@ def admin_user(user: User = Depends(current_user)) -> User:
     return user
 
 
-
 def _display_name_for(user: Optional[User]) -> str:
     if not user:
         return "Member"
@@ -405,8 +462,12 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup():
+    # Create tables first (if DB is empty)
     create_db_and_tables()
+
+    # Best-effort migrations (won't crash app)
     ensure_sqlite_schema()
+    ensure_postgres_schema()
 
     # TEMP BOOTSTRAP (admin+vip + create/reset password)
     # Requires Render env vars:
@@ -436,8 +497,8 @@ def on_startup():
                 u.is_admin = True
                 u.is_vip = True
                 u.plan = PLAN_PRO
-                if not (u.display_name or '').strip():
-                    u.display_name = bootstrap_display_name or 'Admin'
+                if not (u.display_name or "").strip():
+                    u.display_name = bootstrap_display_name or "Admin"
                 session.add(u)
                 session.commit()
                 print(f"[BOOTSTRAP] Updated user {bootstrap_email} password + admin+vip")
@@ -479,6 +540,12 @@ def on_startup():
         print(f"[SCHEMA] Backfill plan failed: {e}")
 
 
+@app.get("/")
+def root():
+    # makes Render / browser show OK instead of 404
+    return {"ok": True, "name": APP_NAME}
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "name": APP_NAME}
@@ -504,7 +571,6 @@ def register(payload: AuthRegister):
         raise HTTPException(400, "Invalid email")
     if len(payload.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
-
 
     display_name = (payload.display_name or "").strip()
     if len(display_name) < 2:
@@ -552,7 +618,6 @@ def me(user: User = Depends(current_user)):
         "credits_balance": int(user.credits_balance or 0),
         "credit_costs": CREDIT_COSTS,
     }
-
 
 
 class PasswordChange(SQLModel):
@@ -851,7 +916,6 @@ async def shopify_orders_paid(request: Request):
         return res
 
 
-
 # ---------------- SUPPORT (private) ----------------
 
 class SupportTicketCreate(SQLModel):
@@ -924,9 +988,6 @@ async def upload_media(
         url = str(request.base_url).rstrip("/") + f"/uploads/{filename}"
 
     return {"url": url}
-
-
-
 
 
 # ---------------- SHOPIFY VIP WEBHOOK (optional) ----------------
@@ -1091,22 +1152,20 @@ def list_posts(
     return out
 
 
-
-
 @app.post("/posts")
 def create_post(payload: PostCreate, user: User = Depends(current_user)):
-    text = (payload.text or "").strip()
-    if not text:
+    text_val = (payload.text or "").strip()
+    if not text_val:
         raise HTTPException(400, "Text required")
 
     # Route store/order issues to private support (not public)
-    if _looks_like_store_issue(text):
+    if _looks_like_store_issue(text_val):
         with Session(engine) as session:
             t = SupportTicket(
                 user_id=user.id,
                 subject="Order / Store issue",
-                message=text,
-                order_number=_extract_order_number(text),
+                message=text_val,
+                order_number=_extract_order_number(text_val),
             )
             session.add(t)
             session.commit()
@@ -1114,12 +1173,12 @@ def create_post(payload: PostCreate, user: User = Depends(current_user)):
         return {"ok": True, "routed": "support", "ticket_id": t.id}
 
     with Session(engine) as session:
-        p = Post(user_id=user.id, text=text, image_url=payload.image_url)
+        p = Post(user_id=user.id, text=text_val, image_url=payload.image_url)
         session.add(p)
         session.commit()
         session.refresh(p)
 
-        if _looks_like_promo_or_contact(text):
+        if _looks_like_promo_or_contact(text_val):
             _ensure_moderation(session, "post", p.id, status="pending", reason="Contains link/contact/promo")
             return {"ok": True, "status": "pending"}
         else:
@@ -1133,7 +1192,6 @@ def create_post(payload: PostCreate, user: User = Depends(current_user)):
             image_url=p.image_url,
             created_at=p.created_at,
         )
-
 
 
 class CommentCreate(SQLModel):
@@ -1176,22 +1234,20 @@ def list_comments(
     return out
 
 
-
-
 @app.post("/posts/{post_id}/comments")
 def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(current_user)):
-    text = (payload.text or "").strip()
-    if not text:
+    text_val = (payload.text or "").strip()
+    if not text_val:
         raise HTTPException(400, "Text required")
 
     # Route store/order issues to private support (not public)
-    if _looks_like_store_issue(text):
+    if _looks_like_store_issue(text_val):
         with Session(engine) as session:
             t = SupportTicket(
                 user_id=user.id,
                 subject="Order / Store issue",
-                message=text,
-                order_number=_extract_order_number(text),
+                message=text_val,
+                order_number=_extract_order_number(text_val),
             )
             session.add(t)
             session.commit()
@@ -1199,14 +1255,14 @@ def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(cu
         return {"ok": True, "routed": "support", "ticket_id": t.id}
 
     # Block links / contact details / advertising (auto-moderation)
-    is_promo = _looks_like_promo_or_contact(text)
+    is_promo = _looks_like_promo_or_contact(text_val)
 
     with Session(engine) as session:
         p = session.get(Post, post_id)
         if not p:
             raise HTTPException(404, "Post not found")
 
-        c = Comment(post_id=post_id, user_id=user.id, text=text)
+        c = Comment(post_id=post_id, user_id=user.id, text=text_val)
         session.add(c)
         session.commit()
         session.refresh(c)
@@ -1225,7 +1281,6 @@ def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(cu
             text=c.text,
             created_at=c.created_at,
         )
-
 
 
 @app.post("/comments/{comment_id}/report")
