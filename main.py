@@ -3,6 +3,10 @@ from __future__ import annotations
 import os
 import re
 import uuid
+import json
+import base64
+import hashlib
+import hmac
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -15,6 +19,8 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 
+import httpx
+
 # Optional web-push support (works if you install pywebpush)
 try:
     from pywebpush import webpush, WebPushException
@@ -25,9 +31,64 @@ except Exception:
 APP_NAME = "Secrets of Decoupage"
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./secrets_app.db")
+# Render often provides postgres:// which SQLAlchemy may not accept
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Prefer psycopg (psycopg3) driver on modern Python (e.g., 3.13 on Render)
+# to avoid psycopg2 wheel/compile issues.
+if DATABASE_URL.split("://", 1)[0] == "postgresql":
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME__USE_A_LONG_RANDOM_SECRET")
 JWT_ALG = "HS256"
 ACCESS_TOKEN_MINUTES = int(os.getenv("ACCESS_TOKEN_MINUTES", "43200"))  # 30 days default
+
+# ---------------- VIP PLANS & CREDITS ----------------
+
+PLAN_FREE = "FREE"
+PLAN_VIP_DIGITAL = "VIP_DIGITAL"
+PLAN_VIP_PRINT = "VIP_PRINT"
+PLAN_PRO = "PRO_STUDIO"
+
+PLAN_DISCOUNT_PERCENT = {
+    PLAN_FREE: 0,
+    PLAN_VIP_DIGITAL: 10,
+    PLAN_VIP_PRINT: 10,
+    PLAN_PRO: 12,
+}
+
+MONTHLY_CREDITS = {
+    PLAN_FREE: 0,
+    PLAN_VIP_DIGITAL: 0,
+    PLAN_VIP_PRINT: 4,
+    PLAN_PRO: 8,
+}
+
+# Credit cost rules (as agreed): A4=1, A5=1, Greeting Cards=1, A3=2
+CREDIT_COSTS = {
+    "A4": 1,
+    "A5": 1,
+    "GREETING": 1,
+    "A3": 2,
+}
+
+CREDIT_UNIT_GBP = float(os.getenv("CREDIT_UNIT_GBP", "2.97"))
+
+# Shopify (Admin API) integration
+SHOPIFY_SHOP_DOMAIN = (os.getenv("SHOPIFY_SHOP_DOMAIN", "") or "").strip()
+SHOPIFY_ADMIN_API_ACCESS_TOKEN = (os.getenv("SHOPIFY_ADMIN_API_ACCESS_TOKEN", "") or "").strip()
+SHOPIFY_API_VERSION = (os.getenv("SHOPIFY_API_VERSION", "2026-01") or "2026-01").strip()
+SHOPIFY_WEBHOOK_SECRET = (os.getenv("SHOPIFY_WEBHOOK_SECRET", "") or "").strip()
+
+# Optional mapping by SKU (preferred) or by title keywords (fallback)
+VIP_DIGITAL_SKU = (os.getenv("VIP_DIGITAL_SKU", "") or "").strip()
+VIP_PRINT_SKU = (os.getenv("VIP_PRINT_SKU", "") or "").strip()
+PRO_STUDIO_SKU = (os.getenv("PRO_STUDIO_SKU", "") or "").strip()
+
+VIP_DIGITAL_TITLE_KEYWORD = (os.getenv("VIP_DIGITAL_TITLE_KEYWORD", "VIP Digital") or "VIP Digital").strip()
+VIP_PRINT_TITLE_KEYWORD = (os.getenv("VIP_PRINT_TITLE_KEYWORD", "VIP Print Pack") or "VIP Print Pack").strip()
+PRO_STUDIO_TITLE_KEYWORD = (os.getenv("PRO_STUDIO_TITLE_KEYWORD", "PRO Studio") or "PRO Studio").strip()
 
 VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "")
 VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "")
@@ -51,7 +112,9 @@ class User(SQLModel, table=True):
     display_name: str = Field(default="", index=True)
     hashed_password: str
     is_admin: bool = False
+    plan: str = Field(default=PLAN_FREE, index=True)
     is_vip: bool = False
+    credits_balance: int = Field(default=0)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -110,6 +173,33 @@ class SupportTicket(SQLModel, table=True):
     image_url: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+
+class CreditLedger(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True, foreign_key="user.id")
+    delta: int
+    reason: str = Field(default="")
+    ref_type: Optional[str] = Field(default=None, index=True)
+    ref_id: Optional[str] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class CreditRedemption(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True, foreign_key="user.id")
+    credits_used: int
+    amount_gbp: float
+    code: str = Field(index=True)
+    shopify_discount_gid: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ShopifyOrderRecord(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True, foreign_key="user.id")
+    shopify_order_id: str = Field(index=True, unique=True)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 # ---------------- HELPERS ----------------
 
 def create_db_and_tables():
@@ -127,6 +217,12 @@ def ensure_sqlite_schema():
             cols = {r[1] for r in rows}  # r[1] = column name
             if "display_name" not in cols:
                 conn.exec_driver_sql('ALTER TABLE "user" ADD COLUMN display_name VARCHAR;')
+                conn.commit()
+            if "plan" not in cols:
+                conn.exec_driver_sql('ALTER TABLE "user" ADD COLUMN plan VARCHAR;')
+                conn.commit()
+            if "credits_balance" not in cols:
+                conn.exec_driver_sql('ALTER TABLE "user" ADD COLUMN credits_balance INTEGER DEFAULT 0;')
                 conn.commit()
     except Exception as e:
         # Don't crash the app if migration fails; tables will still exist.
@@ -164,6 +260,33 @@ def _extract_order_number(text: str) -> Optional[str]:
     t = (text or "")
     m = re.search(r"(?:order\s*#?|#)\s*(\d{3,8})", t, flags=re.I)
     return m.group(1) if m else None
+
+
+_PROMO_PATTERNS = [
+    # links
+    r"https?://",
+    r"\bwww\.",
+    # emails
+    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+    # phone numbers (very loose)
+    r"\+?\d[\d\s().-]{7,}\d",
+    # advertising phrases
+    r"\bmy\s+(shop|store|etsy|amazon|website)\b",
+    r"\bvisit\s+my\b",
+    r"\bbuy\s+from\b",
+    r"\bselling\s+on\b",
+]
+
+
+def _looks_like_promo_or_contact(text: str) -> bool:
+    t = (text or "")
+    for p in _PROMO_PATTERNS:
+        try:
+            if re.search(p, t, flags=re.I):
+                return True
+        except re.error:
+            continue
+    return False
 
 
 def _ensure_moderation(session: Session, content_type: str, content_id: int, status: str = "approved", reason: Optional[str] = None):
@@ -237,27 +360,44 @@ app = FastAPI(title=f"{APP_NAME} API", version="0.1.0")
 
 # --- Media uploads (MVP) ---
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    # Render free instances can be restrictive; fall back to /tmp
+    UPLOAD_DIR = Path("/tmp/uploads")
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 # Serve uploaded files
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 
 # CORS – iPhone/Netlify
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://bejewelled-unicorn-4e0552.netlify.app",
-        "https://app.thesecretsofdecoupage.com",
+def _cors_origins() -> list[str]:
+    # Defaults + local dev
+    defaults = [
         "https://thesecretsofdecoupagecom.netlify.app",
-        # Local dev (opcjonalnie zostaw)
+        "https://thesecretsofdecoupage.com",
+        "https://app.thesecretsofdecoupage.com",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
-        # Jeśli później dodasz własną domenę PWA, dopisz tu:
-        # "https://app.secretsofdecoupage.com",
-    ],
+    ]
+
+    env = (os.getenv("CORS_ALLOW_ORIGINS", "") or "").strip()
+    extra = [o.strip() for o in env.split(",") if o.strip()] if env else []
+
+    # unique, preserve order
+    out: list[str] = []
+    for o in defaults + extra:
+        if o not in out:
+            out.append(o)
+    return out
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -286,6 +426,7 @@ def on_startup():
                     display_name=bootstrap_display_name or "Admin",
                     is_admin=True,
                     is_vip=True,
+                    plan=PLAN_PRO,
                 )
                 session.add(u)
                 session.commit()
@@ -294,6 +435,7 @@ def on_startup():
                 u.hashed_password = hash_password(bootstrap_password)
                 u.is_admin = True
                 u.is_vip = True
+                u.plan = PLAN_PRO
                 if not (u.display_name or '').strip():
                     u.display_name = bootstrap_display_name or 'Admin'
                 session.add(u)
@@ -315,6 +457,26 @@ def on_startup():
                 print(f"[SCHEMA] Filled missing display_name for {changed} users")
     except Exception as e:
         print(f"[SCHEMA] Fill display_name failed: {e}")
+
+    # Backfill plans for older databases (when we only had is_vip).
+    try:
+        with Session(engine) as session:
+            users = session.exec(select(User)).all()
+            changed = 0
+            for u in users:
+                if u.is_vip and ((u.plan or "").strip() in ("", PLAN_FREE)):
+                    u.plan = PLAN_VIP_DIGITAL
+                    session.add(u)
+                    changed += 1
+                if (not u.is_vip) and ((u.plan or "").strip() == ""):
+                    u.plan = PLAN_FREE
+                    session.add(u)
+                    changed += 1
+            if changed:
+                session.commit()
+                print(f"[SCHEMA] Backfilled plan for {changed} users")
+    except Exception as e:
+        print(f"[SCHEMA] Backfill plan failed: {e}")
 
 
 @app.get("/health")
@@ -377,7 +539,19 @@ def login(form: AuthLogin):
 
 @app.get("/me")
 def me(user: User = Depends(current_user)):
-    return {"id": user.id, "email": user.email, "display_name": user.display_name, "is_admin": user.is_admin, "is_vip": user.is_vip}
+    plan = (user.plan or PLAN_FREE).strip() or PLAN_FREE
+    return {
+        "id": user.id,
+        "email": user.email,
+        "display_name": user.display_name,
+        "is_admin": user.is_admin,
+        "is_vip": user.is_vip,
+        "plan": plan,
+        "discount_percent": PLAN_DISCOUNT_PERCENT.get(plan, 0),
+        "monthly_credits": MONTHLY_CREDITS.get(plan, 0),
+        "credits_balance": int(user.credits_balance or 0),
+        "credit_costs": CREDIT_COSTS,
+    }
 
 
 
@@ -406,6 +580,275 @@ def change_password(payload: PasswordChange, user: User = Depends(current_user))
         session.commit()
 
     return {"ok": True}
+
+
+# ---------------- VIP / CREDITS / SHOPIFY ----------------
+
+def _shopify_ready() -> bool:
+    return bool(SHOPIFY_SHOP_DOMAIN and SHOPIFY_ADMIN_API_ACCESS_TOKEN)
+
+
+def _shopify_graphql(query: str, variables: dict | None = None):
+    if not _shopify_ready():
+        raise HTTPException(status_code=501, detail="Shopify integration not configured")
+
+    url = f"https://{SHOPIFY_SHOP_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_ADMIN_API_ACCESS_TOKEN,
+        "Content-Type": "application/json",
+    }
+    payload = {"query": query, "variables": variables or {}}
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            r = client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Shopify request failed: {e}")
+
+    if isinstance(data, dict) and data.get("errors"):
+        # top-level graphql errors
+        raise HTTPException(status_code=502, detail=str(data.get("errors")))
+    return data
+
+
+def _shopify_customer_id_by_email(email: str) -> Optional[str]:
+    q = """
+    query($q:String!) {
+      customers(first: 1, query: $q) {
+        nodes { id email }
+      }
+    }
+    """
+    data = _shopify_graphql(q, {"q": f"email:{email}"})
+    nodes = (((data or {}).get("data") or {}).get("customers") or {}).get("nodes") or []
+    if not nodes:
+        return None
+    return nodes[0].get("id")
+
+
+def _detect_plan_from_line_items(line_items: list[dict]) -> Optional[str]:
+    for li in line_items or []:
+        sku = str(li.get("sku") or "").strip()
+        title = str(li.get("title") or "").strip()
+        t = title.lower()
+
+        if VIP_DIGITAL_SKU and sku == VIP_DIGITAL_SKU:
+            return PLAN_VIP_DIGITAL
+        if VIP_PRINT_SKU and sku == VIP_PRINT_SKU:
+            return PLAN_VIP_PRINT
+        if PRO_STUDIO_SKU and sku == PRO_STUDIO_SKU:
+            return PLAN_PRO
+
+        if VIP_DIGITAL_TITLE_KEYWORD and VIP_DIGITAL_TITLE_KEYWORD.lower() in t:
+            return PLAN_VIP_DIGITAL
+        if VIP_PRINT_TITLE_KEYWORD and VIP_PRINT_TITLE_KEYWORD.lower() in t:
+            return PLAN_VIP_PRINT
+        if PRO_STUDIO_TITLE_KEYWORD and PRO_STUDIO_TITLE_KEYWORD.lower() in t:
+            return PLAN_PRO
+    return None
+
+
+def _add_credit_ledger(session: Session, user_id: int, delta: int, reason: str, ref_type: Optional[str] = None, ref_id: Optional[str] = None):
+    u = session.get(User, user_id)
+    if not u:
+        raise HTTPException(404, "User not found")
+    u.credits_balance = int(u.credits_balance or 0) + int(delta)
+    session.add(u)
+    session.add(CreditLedger(user_id=user_id, delta=int(delta), reason=reason, ref_type=ref_type, ref_id=ref_id))
+
+
+def _apply_plan_and_credits_from_order(session: Session, user: User, shopify_order_id: str, line_items: list[dict]) -> dict:
+    # prevent double processing
+    exists = session.exec(select(ShopifyOrderRecord).where(ShopifyOrderRecord.shopify_order_id == str(shopify_order_id))).first()
+    if exists:
+        return {"ok": True, "skipped": True}
+
+    plan = _detect_plan_from_line_items(line_items)
+    if not plan:
+        # record anyway, so we don't repeatedly parse unknown orders
+        session.add(ShopifyOrderRecord(user_id=user.id, shopify_order_id=str(shopify_order_id)))
+        session.commit()
+        return {"ok": True, "skipped": True, "reason": "No plan matched"}
+
+    user.plan = plan
+    user.is_vip = plan != PLAN_FREE
+    session.add(user)
+
+    credits_to_add = int(MONTHLY_CREDITS.get(plan, 0))
+    if credits_to_add:
+        _add_credit_ledger(session, user.id, credits_to_add, reason=f"Monthly credits for {plan}", ref_type="shopify_order", ref_id=str(shopify_order_id))
+
+    session.add(ShopifyOrderRecord(user_id=user.id, shopify_order_id=str(shopify_order_id)))
+    session.commit()
+    return {"ok": True, "plan": plan, "credits_added": credits_to_add}
+
+
+class ShopifySyncResult(SQLModel):
+    ok: bool
+    updated: bool = False
+    plan: Optional[str] = None
+    credits_added: int = 0
+    message: Optional[str] = None
+
+
+@app.post("/shopify/sync-me", response_model=ShopifySyncResult)
+def shopify_sync_me(user: User = Depends(current_user)):
+    """Manual sync: checks your Shopify orders by email and updates VIP plan + credits."""
+    if not _shopify_ready():
+        raise HTTPException(status_code=501, detail="Shopify integration not configured")
+
+    # Pull recent orders for this email
+    q = """
+    query($q:String!) {
+      orders(first: 20, query: $q, sortKey: PROCESSED_AT, reverse: true) {
+        nodes {
+          id
+          name
+          processedAt
+          email
+          lineItems(first: 50) {
+            nodes { title sku }
+          }
+        }
+      }
+    }
+    """
+
+    data = _shopify_graphql(q, {"q": f"email:{user.email}"})
+    orders = (((data or {}).get("data") or {}).get("orders") or {}).get("nodes") or []
+    if not orders:
+        return ShopifySyncResult(ok=True, updated=False, message="No Shopify orders found for this email")
+
+    updated_any = False
+    plan = None
+    credits_added_total = 0
+
+    with Session(engine) as session:
+        db_user = session.get(User, user.id)
+        for o in orders:
+            oid = o.get("id") or o.get("name")
+            # use gid if available, else name
+            ref_id = str(oid)
+            line_items = ((o.get("lineItems") or {}).get("nodes") or [])
+
+            res = _apply_plan_and_credits_from_order(session, db_user, ref_id, line_items)
+            if not res.get("skipped"):
+                updated_any = True
+                plan = res.get("plan")
+                credits_added_total += int(res.get("credits_added") or 0)
+
+    return ShopifySyncResult(ok=True, updated=updated_any, plan=plan, credits_added=credits_added_total)
+
+
+class RedeemRequest(SQLModel):
+    credits: int
+
+
+@app.post("/credits/redeem-code")
+def redeem_credits_code(payload: RedeemRequest, user: User = Depends(current_user)):
+    credits = int(payload.credits or 0)
+    if credits <= 0:
+        raise HTTPException(400, "Credits must be a positive number")
+
+    with Session(engine) as session:
+        u = session.get(User, user.id)
+        if not u:
+            raise HTTPException(401, "User not found")
+        if int(u.credits_balance or 0) < credits:
+            raise HTTPException(400, "Not enough credits")
+
+        # Create a Shopify discount code (fixed amount) restricted to this customer
+        customer_id = _shopify_customer_id_by_email(u.email)
+        if not customer_id:
+            raise HTTPException(404, "Could not find this email as a Shopify customer")
+
+        amount = round(float(CREDIT_UNIT_GBP) * float(credits), 2)
+        code = f"VIP{uuid.uuid4().hex[:8].upper()}"
+        now = datetime.now(timezone.utc)
+        ends = now + timedelta(days=30)
+
+        mutation = """
+        mutation discountCodeBasicCreate($basicCodeDiscount: DiscountCodeBasicInput!) {
+          discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
+            codeDiscountNode { id }
+            userErrors { field message }
+          }
+        }
+        """
+
+        variables = {
+            "basicCodeDiscount": {
+                "title": f"VIP Credits {u.email} {now.strftime('%Y-%m-%d')}",
+                "code": code,
+                "startsAt": now.isoformat(),
+                "endsAt": ends.isoformat(),
+                "usageLimit": 1,
+                "appliesOncePerCustomer": True,
+                "customerSelection": {"customers": {"add": [customer_id]}},
+                "customerGets": {
+                    "items": {"all": True},
+                    "value": {"discountAmount": {"amount": str(amount), "appliesOnEachItem": False}},
+                },
+            }
+        }
+
+        resp = _shopify_graphql(mutation, variables)
+        out = (((resp or {}).get("data") or {}).get("discountCodeBasicCreate") or {})
+        errs = out.get("userErrors") or []
+        if errs:
+            raise HTTPException(400, f"Shopify error: {errs[0].get('message')}")
+        discount_gid = ((out.get("codeDiscountNode") or {}).get("id"))
+
+        # Deduct credits immediately (one-time code)
+        _add_credit_ledger(session, u.id, -credits, reason="Redeemed credits for discount code", ref_type="discount_code", ref_id=code)
+        session.add(CreditRedemption(user_id=u.id, credits_used=credits, amount_gbp=float(amount), code=code, shopify_discount_gid=discount_gid))
+        session.commit()
+
+        return {
+            "ok": True,
+            "code": code,
+            "amount_gbp": amount,
+            "expires_at": ends.isoformat(),
+            "credits_left": int((session.get(User, u.id).credits_balance) or 0),
+        }
+
+
+@app.post("/webhooks/shopify/orders_paid")
+async def shopify_orders_paid(request: Request):
+    """Shopify webhook: orders/paid. Verifies HMAC and updates plan/credits."""
+    if not SHOPIFY_WEBHOOK_SECRET:
+        raise HTTPException(status_code=501, detail="Webhook secret not configured")
+
+    body = await request.body()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256") or ""
+
+    digest = hmac.new(SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    computed = base64.b64encode(digest).decode("utf-8")
+
+    if not hmac.compare_digest(computed, hmac_header):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    email = (payload.get("email") or (payload.get("customer") or {}).get("email") or "").strip().lower()
+    order_id = payload.get("id") or payload.get("name") or uuid.uuid4().hex
+    line_items = payload.get("line_items") or []
+
+    if not email:
+        return {"ok": True, "skipped": True, "reason": "No email"}
+
+    with Session(engine) as session:
+        u = session.exec(select(User).where(User.email == email)).first()
+        if not u:
+            # User might register later; nothing to do now.
+            return {"ok": True, "skipped": True, "reason": "User not registered in app"}
+
+        res = _apply_plan_and_credits_from_order(session, u, str(order_id), line_items)
+        return res
 
 
 
@@ -652,14 +1095,35 @@ def list_posts(
 
 @app.post("/posts")
 def create_post(payload: PostCreate, user: User = Depends(current_user)):
-    if not payload.text.strip():
+    text = (payload.text or "").strip()
+    if not text:
         raise HTTPException(400, "Text required")
 
+    # Route store/order issues to private support (not public)
+    if _looks_like_store_issue(text):
+        with Session(engine) as session:
+            t = SupportTicket(
+                user_id=user.id,
+                subject="Order / Store issue",
+                message=text,
+                order_number=_extract_order_number(text),
+            )
+            session.add(t)
+            session.commit()
+            session.refresh(t)
+        return {"ok": True, "routed": "support", "ticket_id": t.id}
+
     with Session(engine) as session:
-        p = Post(user_id=user.id, text=payload.text.strip(), image_url=payload.image_url)
+        p = Post(user_id=user.id, text=text, image_url=payload.image_url)
         session.add(p)
         session.commit()
         session.refresh(p)
+
+        if _looks_like_promo_or_contact(text):
+            _ensure_moderation(session, "post", p.id, status="pending", reason="Contains link/contact/promo")
+            return {"ok": True, "status": "pending"}
+        else:
+            _ensure_moderation(session, "post", p.id, status="approved")
 
         return PostOut(
             id=p.id,
@@ -734,6 +1198,9 @@ def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(cu
             session.refresh(t)
         return {"ok": True, "routed": "support", "ticket_id": t.id}
 
+    # Block links / contact details / advertising (auto-moderation)
+    is_promo = _looks_like_promo_or_contact(text)
+
     with Session(engine) as session:
         p = session.get(Post, post_id)
         if not p:
@@ -743,6 +1210,12 @@ def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(cu
         session.add(c)
         session.commit()
         session.refresh(c)
+
+        if is_promo:
+            _ensure_moderation(session, "comment", c.id, status="pending", reason="Contains link/contact/promo")
+            return {"ok": True, "status": "pending"}
+        else:
+            _ensure_moderation(session, "comment", c.id, status="approved")
 
         return CommentOut(
             id=c.id,
