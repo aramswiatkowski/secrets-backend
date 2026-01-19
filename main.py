@@ -14,7 +14,7 @@ from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, status, Body, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm  # <-- CHANGED
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from sqlmodel import SQLModel, Field, Session, create_engine, select
@@ -98,7 +98,7 @@ VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:support@secretsofdecoupage.co
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token", auto_error=False)  # <-- CHANGED
 
 engine = create_engine(
     DATABASE_URL,
@@ -601,6 +601,12 @@ def login(form: AuthLogin):
             raise HTTPException(status_code=401, detail="Incorrect email or password")
         token = create_access_token(user.id)
         return {"access_token": token, "token_type": "bearer"}
+
+
+# ✅ NEW: Swagger "Authorize" needs FORM (x-www-form-urlencoded)
+@app.post("/auth/token")
+def token(form_data: OAuth2PasswordRequestForm = Depends()):
+    return login(AuthLogin(username=form_data.username, password=form_data.password))
 
 
 @app.get("/me")
