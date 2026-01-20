@@ -9,17 +9,17 @@ import hashlib
 import hmac
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Any
 
 from fastapi import FastAPI, Depends, HTTPException, status, Body, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm  # <-- CHANGED
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 
-from sqlalchemy import text  # <-- IMPORTANT (for Postgres auto-migration)
+from sqlalchemy import text  # IMPORTANT (for Postgres auto-migration)
 
 import httpx
 
@@ -98,7 +98,8 @@ VAPID_SUBJECT = os.getenv("VAPID_SUBJECT", "mailto:support@secretsofdecoupage.co
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token", auto_error=False)  # <-- CHANGED
+# Swagger "Authorize" uses tokenUrl here
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token", auto_error=False)
 
 engine = create_engine(
     DATABASE_URL,
@@ -202,6 +203,48 @@ class ShopifyOrderRecord(SQLModel, table=True):
     shopify_order_id: str = Field(index=True, unique=True)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+
+# ---------------- RESPONSE MODELS (fix Swagger "string") ----------------
+
+class TokenOut(SQLModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class MeOut(SQLModel):
+    id: int
+    email: str
+    display_name: str
+    is_admin: bool
+    is_vip: bool
+    plan: str
+    discount_percent: int
+    monthly_credits: int
+    credits_balance: int
+    credit_costs: dict[str, int]
+
+
+class UploadOut(SQLModel):
+    url: str
+
+
+class OkOut(SQLModel):
+    ok: bool = True
+
+
+class SupportTicketOut(SQLModel):
+    ok: bool = True
+    ticket_id: int
+
+
+class RedeemOut(SQLModel):
+    ok: bool
+    code: str
+    amount_gbp: float
+    expires_at: str
+    credits_left: int
+
+
 # ---------------- HELPERS ----------------
 
 def create_db_and_tables():
@@ -294,6 +337,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 def hash_password(plain: str) -> str:
     return pwd_context.hash(plain)
 
+
 # --- Content safety (keep community focused on decoupage) ---
 _STORE_ISSUE_PATTERNS = [
     r"\border\b", r"\border\s*#?\d+", r"#\d{3,8}",
@@ -304,6 +348,7 @@ _STORE_ISSUE_PATTERNS = [
     r"\bcustomer\s+service\b", r"\bcomplain\b", r"\bcomplaint\b",
 ]
 
+
 def _looks_like_store_issue(text: str) -> bool:
     t = (text or "").lower()
     for p in _STORE_ISSUE_PATTERNS:
@@ -313,6 +358,7 @@ def _looks_like_store_issue(text: str) -> bool:
         except re.error:
             continue
     return False
+
 
 def _extract_order_number(text: str) -> Optional[str]:
     t = (text or "")
@@ -366,9 +412,11 @@ def _ensure_moderation(session: Session, content_type: str, content_id: int, sta
     session.commit()
     return item
 
+
 def _get_mod_map(session: Session, content_type: str):
     items = session.exec(select(ModerationItem).where(ModerationItem.content_type == content_type)).all()
     return {i.content_id: i for i in items}
+
 
 def create_access_token(user_id: int) -> str:
     now = datetime.now(timezone.utc)
@@ -423,14 +471,15 @@ except Exception:
     # Render free instances can be restrictive; fall back to /tmp
     UPLOAD_DIR = Path("/tmp/uploads")
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
+
 # Serve uploaded files
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 
 # CORS – iPhone/Netlify
 def _cors_origins() -> list[str]:
-    # Defaults + local dev
     defaults = [
         "https://thesecretsofdecoupagecom.netlify.app",
         "https://thesecretsofdecoupage.com",
@@ -444,7 +493,6 @@ def _cors_origins() -> list[str]:
     env = (os.getenv("CORS_ALLOW_ORIGINS", "") or "").strip()
     extra = [o.strip() for o in env.split(",") if o.strip()] if env else []
 
-    # unique, preserve order
     out: list[str] = []
     for o in defaults + extra:
         if o not in out:
@@ -459,6 +507,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.on_event("startup")
 def on_startup():
@@ -503,7 +552,7 @@ def on_startup():
                 session.commit()
                 print(f"[BOOTSTRAP] Updated user {bootstrap_email} password + admin+vip")
 
-    # Ensure every existing user has a non-empty display_name (never expose email publicly)
+    # Ensure every existing user has a non-empty display_name
     try:
         with Session(engine) as session:
             users = session.exec(select(User)).all()
@@ -540,13 +589,12 @@ def on_startup():
         print(f"[SCHEMA] Backfill plan failed: {e}")
 
 
-@app.get("/")
+@app.get("/", response_model=dict[str, Any])
 def root():
-    # makes Render / browser show OK instead of 404
     return {"ok": True, "name": APP_NAME}
 
 
-@app.get("/health")
+@app.get("/health", response_model=dict[str, Any])
 def health():
     return {"ok": True, "name": APP_NAME}
 
@@ -564,7 +612,7 @@ class AuthLogin(SQLModel):
     password: str
 
 
-@app.post("/auth/register")
+@app.post("/auth/register", response_model=TokenOut)
 def register(payload: AuthRegister):
     email = payload.email.strip().lower()
     if "@" not in email:
@@ -588,42 +636,51 @@ def register(payload: AuthRegister):
         session.commit()
         session.refresh(user)
 
-        token = create_access_token(user.id)
-        return {"access_token": token, "token_type": "bearer"}
+        token_val = create_access_token(user.id)
+        return TokenOut(access_token=token_val)
 
 
-@app.post("/auth/login")
+@app.post("/auth/login", response_model=TokenOut)
 def login(form: AuthLogin):
     email = form.username.strip().lower()
     with Session(engine) as session:
         user = session.exec(select(User).where(User.email == email)).first()
         if not user or not verify_password(form.password, user.hashed_password):
             raise HTTPException(status_code=401, detail="Incorrect email or password")
-        token = create_access_token(user.id)
-        return {"access_token": token, "token_type": "bearer"}
+        token_val = create_access_token(user.id)
+        return TokenOut(access_token=token_val)
 
 
-# ✅ NEW: Swagger "Authorize" needs FORM (x-www-form-urlencoded)
-@app.post("/auth/token")
+# Swagger "Authorize" needs FORM (x-www-form-urlencoded)
+@app.post("/auth/token", response_model=TokenOut)
 def token(form_data: OAuth2PasswordRequestForm = Depends()):
-    return login(AuthLogin(username=form_data.username, password=form_data.password))
+    email = (form_data.username or "").strip().lower()
+    password = form_data.password or ""
+
+    with Session(engine) as session:
+        user = session.exec(select(User).where(User.email == email)).first()
+        if not user or not verify_password(password, user.hashed_password):
+            raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+        token_val = create_access_token(user.id)
+        return TokenOut(access_token=token_val)
 
 
-@app.get("/me")
+@app.get("/me", response_model=MeOut)
 def me(user: User = Depends(current_user)):
     plan = (user.plan or PLAN_FREE).strip() or PLAN_FREE
-    return {
-        "id": user.id,
-        "email": user.email,
-        "display_name": user.display_name,
-        "is_admin": user.is_admin,
-        "is_vip": user.is_vip,
-        "plan": plan,
-        "discount_percent": PLAN_DISCOUNT_PERCENT.get(plan, 0),
-        "monthly_credits": MONTHLY_CREDITS.get(plan, 0),
-        "credits_balance": int(user.credits_balance or 0),
-        "credit_costs": CREDIT_COSTS,
-    }
+    return MeOut(
+        id=user.id,
+        email=user.email,
+        display_name=user.display_name,
+        is_admin=user.is_admin,
+        is_vip=user.is_vip,
+        plan=plan,
+        discount_percent=PLAN_DISCOUNT_PERCENT.get(plan, 0),
+        monthly_credits=MONTHLY_CREDITS.get(plan, 0),
+        credits_balance=int(user.credits_balance or 0),
+        credit_costs=CREDIT_COSTS,
+    )
 
 
 class PasswordChange(SQLModel):
@@ -631,7 +688,7 @@ class PasswordChange(SQLModel):
     new_password: str
 
 
-@app.post("/me/password")
+@app.post("/me/password", response_model=OkOut)
 def change_password(payload: PasswordChange, user: User = Depends(current_user)):
     old_pw = (payload.old_password or "").strip()
     new_pw = (payload.new_password or "").strip()
@@ -650,7 +707,7 @@ def change_password(payload: PasswordChange, user: User = Depends(current_user))
         session.add(u)
         session.commit()
 
-    return {"ok": True}
+    return OkOut(ok=True)
 
 
 # ---------------- VIP / CREDITS / SHOPIFY ----------------
@@ -678,7 +735,6 @@ def _shopify_graphql(query: str, variables: dict | None = None):
         raise HTTPException(status_code=502, detail=f"Shopify request failed: {e}")
 
     if isinstance(data, dict) and data.get("errors"):
-        # top-level graphql errors
         raise HTTPException(status_code=502, detail=str(data.get("errors")))
     return data
 
@@ -720,7 +776,14 @@ def _detect_plan_from_line_items(line_items: list[dict]) -> Optional[str]:
     return None
 
 
-def _add_credit_ledger(session: Session, user_id: int, delta: int, reason: str, ref_type: Optional[str] = None, ref_id: Optional[str] = None):
+def _add_credit_ledger(
+    session: Session,
+    user_id: int,
+    delta: int,
+    reason: str,
+    ref_type: Optional[str] = None,
+    ref_id: Optional[str] = None
+):
     u = session.get(User, user_id)
     if not u:
         raise HTTPException(404, "User not found")
@@ -730,14 +793,14 @@ def _add_credit_ledger(session: Session, user_id: int, delta: int, reason: str, 
 
 
 def _apply_plan_and_credits_from_order(session: Session, user: User, shopify_order_id: str, line_items: list[dict]) -> dict:
-    # prevent double processing
-    exists = session.exec(select(ShopifyOrderRecord).where(ShopifyOrderRecord.shopify_order_id == str(shopify_order_id))).first()
+    exists = session.exec(
+        select(ShopifyOrderRecord).where(ShopifyOrderRecord.shopify_order_id == str(shopify_order_id))
+    ).first()
     if exists:
         return {"ok": True, "skipped": True}
 
     plan = _detect_plan_from_line_items(line_items)
     if not plan:
-        # record anyway, so we don't repeatedly parse unknown orders
         session.add(ShopifyOrderRecord(user_id=user.id, shopify_order_id=str(shopify_order_id)))
         session.commit()
         return {"ok": True, "skipped": True, "reason": "No plan matched"}
@@ -748,7 +811,14 @@ def _apply_plan_and_credits_from_order(session: Session, user: User, shopify_ord
 
     credits_to_add = int(MONTHLY_CREDITS.get(plan, 0))
     if credits_to_add:
-        _add_credit_ledger(session, user.id, credits_to_add, reason=f"Monthly credits for {plan}", ref_type="shopify_order", ref_id=str(shopify_order_id))
+        _add_credit_ledger(
+            session,
+            user.id,
+            credits_to_add,
+            reason=f"Monthly credits for {plan}",
+            ref_type="shopify_order",
+            ref_id=str(shopify_order_id),
+        )
 
     session.add(ShopifyOrderRecord(user_id=user.id, shopify_order_id=str(shopify_order_id)))
     session.commit()
@@ -769,7 +839,6 @@ def shopify_sync_me(user: User = Depends(current_user)):
     if not _shopify_ready():
         raise HTTPException(status_code=501, detail="Shopify integration not configured")
 
-    # Pull recent orders for this email
     q = """
     query($q:String!) {
       orders(first: 20, query: $q, sortKey: PROCESSED_AT, reverse: true) {
@@ -799,7 +868,6 @@ def shopify_sync_me(user: User = Depends(current_user)):
         db_user = session.get(User, user.id)
         for o in orders:
             oid = o.get("id") or o.get("name")
-            # use gid if available, else name
             ref_id = str(oid)
             line_items = ((o.get("lineItems") or {}).get("nodes") or [])
 
@@ -816,7 +884,7 @@ class RedeemRequest(SQLModel):
     credits: int
 
 
-@app.post("/credits/redeem-code")
+@app.post("/credits/redeem-code", response_model=RedeemOut)
 def redeem_credits_code(payload: RedeemRequest, user: User = Depends(current_user)):
     credits = int(payload.credits or 0)
     if credits <= 0:
@@ -829,7 +897,6 @@ def redeem_credits_code(payload: RedeemRequest, user: User = Depends(current_use
         if int(u.credits_balance or 0) < credits:
             raise HTTPException(400, "Not enough credits")
 
-        # Create a Shopify discount code (fixed amount) restricted to this customer
         customer_id = _shopify_customer_id_by_email(u.email)
         if not customer_id:
             raise HTTPException(404, "Could not find this email as a Shopify customer")
@@ -871,21 +938,28 @@ def redeem_credits_code(payload: RedeemRequest, user: User = Depends(current_use
             raise HTTPException(400, f"Shopify error: {errs[0].get('message')}")
         discount_gid = ((out.get("codeDiscountNode") or {}).get("id"))
 
-        # Deduct credits immediately (one-time code)
-        _add_credit_ledger(session, u.id, -credits, reason="Redeemed credits for discount code", ref_type="discount_code", ref_id=code)
+        _add_credit_ledger(
+            session,
+            u.id,
+            -credits,
+            reason="Redeemed credits for discount code",
+            ref_type="discount_code",
+            ref_id=code,
+        )
         session.add(CreditRedemption(user_id=u.id, credits_used=credits, amount_gbp=float(amount), code=code, shopify_discount_gid=discount_gid))
         session.commit()
 
-        return {
-            "ok": True,
-            "code": code,
-            "amount_gbp": amount,
-            "expires_at": ends.isoformat(),
-            "credits_left": int((session.get(User, u.id).credits_balance) or 0),
-        }
+        refreshed = session.get(User, u.id)
+        return RedeemOut(
+            ok=True,
+            code=code,
+            amount_gbp=amount,
+            expires_at=ends.isoformat(),
+            credits_left=int((refreshed.credits_balance if refreshed else 0) or 0),
+        )
 
 
-@app.post("/webhooks/shopify/orders_paid")
+@app.post("/webhooks/shopify/orders_paid", response_model=dict[str, Any])
 async def shopify_orders_paid(request: Request):
     """Shopify webhook: orders/paid. Verifies HMAC and updates plan/credits."""
     if not SHOPIFY_WEBHOOK_SECRET:
@@ -915,7 +989,6 @@ async def shopify_orders_paid(request: Request):
     with Session(engine) as session:
         u = session.exec(select(User).where(User.email == email)).first()
         if not u:
-            # User might register later; nothing to do now.
             return {"ok": True, "skipped": True, "reason": "User not registered in app"}
 
         res = _apply_plan_and_credits_from_order(session, u, str(order_id), line_items)
@@ -931,7 +1004,7 @@ class SupportTicketCreate(SQLModel):
     image_url: Optional[str] = None
 
 
-@app.post("/support/tickets")
+@app.post("/support/tickets", response_model=SupportTicketOut)
 def create_support_ticket(payload: SupportTicketCreate, user: User = Depends(current_user)):
     subj = (payload.subject or "").strip()[:120]
     msg = (payload.message or "").strip()
@@ -951,10 +1024,10 @@ def create_support_ticket(payload: SupportTicketCreate, user: User = Depends(cur
         session.add(t)
         session.commit()
         session.refresh(t)
-        return {"ok": True, "ticket_id": t.id}
+        return SupportTicketOut(ok=True, ticket_id=t.id)
 
 
-@app.get("/admin/support/tickets")
+@app.get("/admin/support/tickets", response_model=list[SupportTicket])
 def admin_list_support_tickets(_: User = Depends(admin_user), limit: int = 100):
     with Session(engine) as session:
         tickets = session.exec(select(SupportTicket).order_by(SupportTicket.created_at.desc()).limit(limit)).all()
@@ -969,13 +1042,13 @@ ALLOWED_IMAGE_TYPES = {
     "image/webp": ".webp",
 }
 
-@app.post("/media/upload")
+
+@app.post("/media/upload", response_model=UploadOut)
 async def upload_media(
     request: Request,
     file: UploadFile = File(...),
     user: User = Depends(current_user),
 ):
-    # Only logged-in users can upload (so we can later limit abuse)
     if file.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(status_code=400, detail="Only JPG, PNG or WEBP images are allowed")
 
@@ -993,7 +1066,7 @@ async def upload_media(
     else:
         url = str(request.base_url).rstrip("/") + f"/uploads/{filename}"
 
-    return {"url": url}
+    return UploadOut(url=url)
 
 
 # ---------------- SHOPIFY VIP WEBHOOK (optional) ----------------
@@ -1003,7 +1076,7 @@ class VipWebhook(SQLModel):
     is_vip: bool = True
 
 
-@app.post("/webhooks/vip")
+@app.post("/webhooks/vip", response_model=dict[str, Any])
 def shopify_vip_webhook(payload: VipWebhook, request: Request):
     secret = (os.getenv("VIP_WEBHOOK_SECRET", "") or "").strip()
     if secret:
@@ -1017,7 +1090,6 @@ def shopify_vip_webhook(payload: VipWebhook, request: Request):
     with Session(engine) as session:
         u = session.exec(select(User).where(User.email == email)).first()
         if not u:
-            # User must register in the app with the same email first.
             raise HTTPException(404, "User not found (please register in the app first)")
         u.is_vip = bool(payload.is_vip)
         session.add(u)
@@ -1029,7 +1101,7 @@ class DisplayNameUpdate(SQLModel):
     display_name: str
 
 
-@app.post("/me/display-name")
+@app.post("/me/display-name", response_model=dict[str, Any])
 def update_display_name(payload: DisplayNameUpdate, user: User = Depends(current_user)):
     display_name = (payload.display_name or "").strip()
     if len(display_name) < 2:
@@ -1057,14 +1129,14 @@ class TrickCreate(SQLModel):
     is_vip: bool = False
 
 
-@app.get("/tricks")
+@app.get("/tricks", response_model=list[Trick])
 def list_tricks(
     user: Optional[User] = Depends(lambda token=Depends(oauth2_scheme): get_user_from_token(token) if token else None)
 ):
     with Session(engine) as session:
         tricks = session.exec(select(Trick).order_by(Trick.created_at.desc())).all()
 
-    out = []
+    out: list[Trick] = []
     for t in tricks:
         if t.is_vip and (not user or not user.is_vip):
             continue
@@ -1072,7 +1144,7 @@ def list_tricks(
     return out
 
 
-@app.post("/tricks")
+@app.post("/tricks", response_model=Trick)
 def create_trick(payload: TrickCreate, _: User = Depends(admin_user)):
     if not payload.title.strip():
         raise HTTPException(400, "Title required")
@@ -1089,7 +1161,7 @@ def create_trick(payload: TrickCreate, _: User = Depends(admin_user)):
         return t
 
 
-@app.delete("/tricks/{trick_id}")
+@app.delete("/tricks/{trick_id}", response_model=OkOut)
 def delete_trick(trick_id: int, _: User = Depends(admin_user)):
     with Session(engine) as session:
         t = session.get(Trick, trick_id)
@@ -1097,7 +1169,7 @@ def delete_trick(trick_id: int, _: User = Depends(admin_user)):
             raise HTTPException(404, "Not found")
         session.delete(t)
         session.commit()
-        return {"ok": True}
+        return OkOut(ok=True)
 
 
 # ---------------- COMMUNITY ----------------
@@ -1125,7 +1197,7 @@ class CommentOut(SQLModel):
     created_at: datetime
 
 
-@app.get("/posts")
+@app.get("/posts", response_model=list[PostOut])
 def list_posts(
     user: Optional[User] = Depends(lambda token=Depends(oauth2_scheme): get_user_from_token(token) if token else None)
 ):
@@ -1158,7 +1230,7 @@ def list_posts(
     return out
 
 
-@app.post("/posts")
+@app.post("/posts", response_model=Any)
 def create_post(payload: PostCreate, user: User = Depends(current_user)):
     text_val = (payload.text or "").strip()
     if not text_val:
@@ -1204,7 +1276,7 @@ class CommentCreate(SQLModel):
     text: str
 
 
-@app.get("/posts/{post_id}/comments")
+@app.get("/posts/{post_id}/comments", response_model=list[CommentOut])
 def list_comments(
     post_id: int,
     user: Optional[User] = Depends(lambda token=Depends(oauth2_scheme): get_user_from_token(token) if token else None),
@@ -1240,7 +1312,7 @@ def list_comments(
     return out
 
 
-@app.post("/posts/{post_id}/comments")
+@app.post("/posts/{post_id}/comments", response_model=Any)
 def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(current_user)):
     text_val = (payload.text or "").strip()
     if not text_val:
@@ -1260,7 +1332,6 @@ def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(cu
             session.refresh(t)
         return {"ok": True, "routed": "support", "ticket_id": t.id}
 
-    # Block links / contact details / advertising (auto-moderation)
     is_promo = _looks_like_promo_or_contact(text_val)
 
     with Session(engine) as session:
@@ -1289,7 +1360,7 @@ def create_comment(post_id: int, payload: CommentCreate, user: User = Depends(cu
         )
 
 
-@app.post("/comments/{comment_id}/report")
+@app.post("/comments/{comment_id}/report", response_model=OkOut)
 def report_comment(comment_id: int, user: User = Depends(current_user)):
     with Session(engine) as session:
         c = session.get(Comment, comment_id)
@@ -1302,10 +1373,10 @@ def report_comment(comment_id: int, user: User = Depends(current_user)):
             mi.reason = "Auto-hidden after reports"
         session.add(mi)
         session.commit()
-    return {"ok": True}
+    return OkOut(ok=True)
 
 
-@app.get("/admin/moderation/pending")
+@app.get("/admin/moderation/pending", response_model=list[ModerationItem])
 def admin_list_pending(_: User = Depends(admin_user), limit: int = 200):
     with Session(engine) as session:
         items = session.exec(
@@ -1322,21 +1393,21 @@ class ModerationUpdate(SQLModel):
     reason: Optional[str] = None
 
 
-@app.post("/admin/moderation/{content_type}/{content_id}")
+@app.post("/admin/moderation/{content_type}/{content_id}", response_model=OkOut)
 def admin_set_moderation(content_type: str, content_id: int, payload: ModerationUpdate, _: User = Depends(admin_user)):
     if content_type not in ("post", "comment"):
         raise HTTPException(400, "Invalid content_type")
     if payload.status not in ("approved", "hidden", "pending"):
         raise HTTPException(400, "Invalid status")
     with Session(engine) as session:
-        mi = _ensure_moderation(session, content_type, content_id, status=payload.status, reason=payload.reason)
-        session.add(mi)
+        _ensure_moderation(session, content_type, content_id, status=payload.status, reason=payload.reason)
         session.commit()
-    return {"ok": True, "content_type": content_type, "content_id": content_id, "status": payload.status}
+    return OkOut(ok=True)
+
 
 # ---------------- ADMIN ----------------
 
-@app.post("/admin/users/{user_id}/vip")
+@app.post("/admin/users/{user_id}/vip", response_model=dict[str, Any])
 def set_vip(user_id: int, is_vip: bool = Body(...), _: User = Depends(admin_user)):
     with Session(engine) as session:
         u = session.get(User, user_id)
@@ -1348,7 +1419,7 @@ def set_vip(user_id: int, is_vip: bool = Body(...), _: User = Depends(admin_user
         return {"ok": True, "user_id": user_id, "is_vip": u.is_vip}
 
 
-@app.post("/admin/users/{user_id}/admin")
+@app.post("/admin/users/{user_id}/admin", response_model=dict[str, Any])
 def set_admin(user_id: int, is_admin: bool = Body(...), _: User = Depends(admin_user)):
     with Session(engine) as session:
         u = session.get(User, user_id)
@@ -1368,7 +1439,7 @@ class PushSubscribe(SQLModel):
     auth: str
 
 
-@app.post("/push/subscribe")
+@app.post("/push/subscribe", response_model=dict[str, Any])
 def push_subscribe(payload: PushSubscribe, user: User = Depends(current_user)):
     with Session(engine) as session:
         existing = session.exec(
@@ -1394,7 +1465,7 @@ def push_subscribe(payload: PushSubscribe, user: User = Depends(current_user)):
         return {"ok": True}
 
 
-@app.post("/admin/push/broadcast")
+@app.post("/admin/push/broadcast", response_model=dict[str, Any])
 def push_broadcast(message: str = Body(..., embed=True), _: User = Depends(admin_user)):
     if webpush is None:
         raise HTTPException(501, "pywebpush not installed")
